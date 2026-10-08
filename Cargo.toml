@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.91"
 license = "MIT"
-description = "Self-contained per-project kanban board (backlog/todo/doing/review/done). Port of hermes' kanban model."
+description = "Self-contained per-project kanban board (backlog/todo/doing/review/done)."
 
 [[bin]]
 name = "gray-kanban"

@@ -1,6 +1,6 @@
 //! gray-kanban — a tiny per-project kanban for the agent and the user.
 //!
-//! Port of hermes' kanban model (self-contained subset): one `kanban` tool
+//! One `kanban` tool
 //! ({action: boards|create|add|move|done|show|rm}) plus `/kanban [board]`
 //! which renders the board as text columns. Boards live under
 //! `~/.gray/kanban/<cwd-hash>/<board>.json` — keyed to the session's working
