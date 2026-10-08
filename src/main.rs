@@ -7,14 +7,44 @@
 //! directory so different projects get different boards.
 //!
 //! Columns: backlog | todo | doing | review | done. Card ids: k1, k2, …
+//!
+//! `/kanban move [board]` is interactive when the host grants `host.ask`:
+//! step 1 picks a card, step 2 picks the target column, then the move runs
+//! through the same path as the tool's `move` action. With no ask channel it
+//! falls back to the board render.
 
+use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 
 const COLS: [&str; 5] = ["backlog", "todo", "doing", "review", "done"];
 const COL_WIDTH: usize = 24;
+
+/// host/ask round-trip signature — the real one lives in `main` (writes the
+/// request to stdout, blocks on a pending channel); tests inject canned
+/// answers. Params are the full `host/ask` params object; returns the reply's
+/// `result`, or None on timeout.
+type Ask<'a> = dyn FnMut(&Value) -> Option<Value> + 'a;
+
+type Pending = Arc<Mutex<HashMap<String, mpsc::Sender<Value>>>>;
+/// Internal cap on host/ask waits — under the host's outer TTL.
+const ASK_TTL: Duration = Duration::from_secs(300);
+const Q_CARD: &str = "kanban-card";
+const Q_COL: &str = "kanban-col";
+const LABEL_CANCEL: &str = "cancel";
+
+/// First picked label out of a host/ask reply — None on absent/timeout/empty.
+fn picked_label(result: Option<&Value>, qid: &str) -> Option<String> {
+    result?
+        .pointer(&format!("/answers/{qid}/answers/0"))?
+        .as_str()
+        .map(String::from)
+        .filter(|s| !s.is_empty())
+}
 
 fn manifest() -> Value {
     json!({
@@ -38,6 +68,7 @@ fn manifest() -> Value {
             }
         }],
         "commands": ["/kanban"],
+        "capabilities": ["host.ask"],
     })
 }
 
@@ -323,11 +354,79 @@ fn call_tool(name: &str, args: &Value, session: &Value) -> Result<String, String
     }
 }
 
+/// `/kanban move [board]` — two-step picker: choose a card, then a column,
+/// and apply through `act_move`. Any ask failure (ungranted capability,
+/// timeout, cancel) falls back to the board render.
+fn move_interactive(cwd: &str, board: &str, ask: &mut Ask) -> String {
+    let b = match load_board(cwd, board) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    let mut card_opts: Vec<Value> = Vec::new();
+    for c in COLS {
+        if let Some(cards) = b["cols"][c].as_array() {
+            for card in cards {
+                let id = card.get("id").and_then(Value::as_str).unwrap_or("?");
+                let title = card.get("title").and_then(Value::as_str).unwrap_or("");
+                card_opts.push(json!({
+                    "label": format!("{id} {title}"),
+                    "description": format!("in {c}"),
+                }));
+            }
+        }
+    }
+    if card_opts.is_empty() {
+        return format!("board '{board}' has no cards — nothing to move");
+    }
+    card_opts.push(json!({"label": LABEL_CANCEL, "description": "don't move anything"}));
+    let picked = ask(&json!({
+        "questions": [{
+            "id": Q_CARD,
+            "header": "Move card",
+            "question": format!("Move which card on '{board}'?"),
+            "options": card_opts,
+        }],
+        "blocking": true,
+    }));
+    let label = picked_label(picked.as_ref(), Q_CARD).unwrap_or_default();
+    if label.is_empty() || label == LABEL_CANCEL {
+        return render(&b);
+    }
+    // Card labels are "<id> <title>"; the id is the first token.
+    let id = label.split_whitespace().next().unwrap_or("");
+    let mut col_opts: Vec<Value> = COLS
+        .iter()
+        .map(|c| json!({"label": c, "description": format!("move {id} here")}))
+        .collect();
+    col_opts.push(json!({"label": LABEL_CANCEL, "description": "don't move anything"}));
+    let picked = ask(&json!({
+        "questions": [{
+            "id": Q_COL,
+            "header": "Move card",
+            "question": format!("Move {id} to which column?"),
+            "options": col_opts,
+        }],
+        "blocking": true,
+    }));
+    let col = picked_label(picked.as_ref(), Q_COL).unwrap_or_default();
+    if col.is_empty() || col == LABEL_CANCEL || !valid_col(&col) {
+        return render(&b);
+    }
+    match act_move(cwd, board, &json!({"id": id, "col": col}), None) {
+        Ok(text) => format!(
+            "{text}\n\n{}",
+            render(&load_board(cwd, board).unwrap_or(b))
+        ),
+        Err(e) => e,
+    }
+}
+
 /// `/kanban [board]` — render the board as text columns for the user.
-fn run_command(argv: &[&str], session: &Value) -> String {
+fn run_command(argv: &[&str], session: &Value, ask: &mut Ask) -> String {
     let cwd = session_cwd(&json!({ "session": session }));
     match argv.first().copied() {
         Some("boards") => act_boards(&cwd).unwrap_or_else(|e| e),
+        Some("move") => move_interactive(&cwd, argv.get(1).copied().unwrap_or("main"), ask),
         Some(board) => match load_board(&cwd, board) {
             Ok(b) => render(&b),
             Err(e) => e,
@@ -343,7 +442,7 @@ fn run_command(argv: &[&str], session: &Value) -> String {
 
 /// One request → `Some(reply)`, or `None` for notifications. The bool asks
 /// the loop to exit after writing the reply.
-fn handle(req: &Value) -> (Option<Value>, bool) {
+fn handle(req: &Value, ask: &mut Ask) -> (Option<Value>, bool) {
     let id = req.get("id").cloned();
     let method = req.get("method").and_then(Value::as_str).unwrap_or("");
     let params = req.get("params").cloned().unwrap_or(Value::Null);
@@ -368,7 +467,7 @@ fn handle(req: &Value) -> (Option<Value>, bool) {
                 .map(|a| a.iter().filter_map(Value::as_str).collect())
                 .unwrap_or_default();
             let session = params.get("session").cloned().unwrap_or(Value::Null);
-            json!({ "text": run_command(&argv, &session) })
+            json!({ "text": run_command(&argv, &session, ask) })
         }
         "plugin/shutdown" => return (Some(json!({ "id": id, "result": {} })), true),
         _ => {
@@ -384,20 +483,68 @@ fn main() -> std::io::Result<()> {
         println!("{}", manifest());
         return Ok(());
     }
-    let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout();
-    for line in stdin.lock().lines() {
-        let line = line?;
-        let Ok(req) = serde_json::from_str::<Value>(&line) else { continue };
-        let (reply, exit) = handle(&req);
+    let stdout = Arc::new(Mutex::new(std::io::stdout()));
+    let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+    let counter = Mutex::new(0u64);
+
+    // Reader thread: host answers (string id, no method) go to `pending`;
+    // host requests (id + method) go to the work channel. Notifications have
+    // no id and are dropped here, same as `handle` returning None.
+    let (work_tx, work_rx) = mpsc::channel::<Value>();
+    let reader_pending = pending.clone();
+    std::thread::spawn(move || {
+        let stdin = std::io::stdin();
+        for line in stdin.lock().lines() {
+            let Ok(line) = line else { break };
+            let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+            if let Some(id) = v.get("id").and_then(Value::as_str)
+                && v.get("method").is_none()
+            {
+                if let Some(tx) = reader_pending.lock().expect("pending").remove(id) {
+                    let _ = tx.send(v.get("result").cloned().unwrap_or(Value::Null));
+                }
+                continue;
+            }
+            if v.get("id").is_some() && work_tx.send(v).is_err() {
+                break;
+            }
+        }
+    });
+
+    // host/ask: write the request, block on the pending channel. Errors and
+    // timeouts surface as None → callers degrade to a text answer.
+    let mut ask = |params: &Value| -> Option<Value> {
+        let id = {
+            let mut n = counter.lock().expect("id counter");
+            *n += 1;
+            format!("q{n}")
+        };
+        let (tx, rx) = mpsc::channel();
+        pending.lock().expect("pending").insert(id.clone(), tx);
+        {
+            let req = json!({"id": id, "method": "host/ask", "params": params});
+            let mut o = stdout.lock().expect("stdout");
+            let _ = writeln!(o, "{req}");
+            let _ = o.flush();
+        }
+        let reply = rx.recv_timeout(ASK_TTL).ok();
+        pending.lock().expect("pending").remove(&id);
+        reply
+    };
+
+    for req in work_rx {
+        let (reply, exit) = handle(&req, &mut ask);
         if let Some(reply) = reply {
-            writeln!(stdout, "{reply}")?;
-            stdout.flush()?;
+            let mut o = stdout.lock().expect("stdout");
+            let _ = writeln!(o, "{reply}");
+            let _ = o.flush();
         }
         if exit {
             break;
         }
     }
+    // The reader thread is a detached stdin pump; returning ends the process
+    // with it — nothing to join.
     Ok(())
 }
 
@@ -426,7 +573,28 @@ mod tests {
     }
 
     fn call(method: &str, params: Value) -> Value {
-        handle(&json!({ "id": 1, "method": method, "params": params })).0.unwrap()
+        call_ask(method, params, &mut |_p: &Value| None)
+    }
+
+    fn call_ask(method: &str, params: Value, ask: &mut Ask) -> Value {
+        handle(&json!({ "id": 1, "method": method, "params": params }), ask)
+            .0
+            .unwrap()
+    }
+
+    /// Test asker: answers each successive host/ask by picking the option at
+    /// the next index in `idxs` (then keeps picking index 0).
+    fn picking_seq(idxs: Vec<usize>) -> impl FnMut(&Value) -> Option<Value> {
+        let mut it = idxs.into_iter();
+        move |p: &Value| {
+            let i = it.next().unwrap_or(0);
+            let q = &p["questions"][0];
+            let qid = q["id"].as_str().unwrap_or("q").to_string();
+            let label = q["options"][i]["label"].as_str()?.to_string();
+            let mut answers = serde_json::Map::new();
+            answers.insert(qid, json!({"answers": [label]}));
+            Some(json!({"answers": answers}))
+        }
     }
 
     fn tool(args: Value) -> Value {
@@ -443,6 +611,7 @@ mod tests {
         assert_eq!(m["name"], "kanban");
         assert_eq!(m["commands"], json!(["/kanban"]));
         assert_eq!(m["tools"][0]["name"], "kanban");
+        assert_eq!(m["capabilities"], json!(["host.ask"]));
     }
 
     #[test]
@@ -522,8 +691,57 @@ mod tests {
     }
 
     #[test]
+    fn move_picker_moves_card() {
+        let _g = LOCK.lock().unwrap();
+        let _h = TempHome::new();
+        tool(json!({"action": "add", "title": "write tests"}));
+        // Options: [k1 card, cancel] then [backlog, todo, doing, review, done, cancel].
+        let mut ask = picking_seq(vec![0, 2]);
+        let r = call_ask(
+            "command/run",
+            json!({ "name": "/kanban", "argv": ["move"], "session": {"cwd": "/tmp/proj"} }),
+            &mut ask,
+        );
+        let text = r["result"]["text"].as_str().unwrap();
+        assert!(text.contains("moved k1 backlog → doing"), "{text}");
+        assert!(text.contains("DOING (1)"), "{text}");
+    }
+
+    #[test]
+    fn move_picker_no_ask_falls_back_to_render() {
+        let _g = LOCK.lock().unwrap();
+        let _h = TempHome::new();
+        tool(json!({"action": "add", "title": "x"}));
+        let r = call(
+            "command/run",
+            json!({ "name": "/kanban", "argv": ["move"], "session": {"cwd": "/tmp/proj"} }),
+        );
+        let text = r["result"]["text"].as_str().unwrap();
+        assert!(text.contains("kanban: main") && text.contains("k1 x"), "{text}");
+        // Card unmoved: still in backlog.
+        let r = tool(json!({"action": "show"}));
+        assert!(r["content"].as_str().unwrap().contains("BACKLOG (1)"), "{r}");
+    }
+
+    #[test]
+    fn move_picker_cancel_at_second_step() {
+        let _g = LOCK.lock().unwrap();
+        let _h = TempHome::new();
+        tool(json!({"action": "add", "title": "x"}));
+        // Pick the card, then "cancel" (last column option = index 5).
+        let mut ask = picking_seq(vec![0, 5]);
+        let r = call_ask(
+            "command/run",
+            json!({ "name": "/kanban", "argv": ["move"], "session": {"cwd": "/tmp/proj"} }),
+            &mut ask,
+        );
+        let text = r["result"]["text"].as_str().unwrap();
+        assert!(text.contains("kanban: main") && !text.contains("moved"), "{text}");
+    }
+
+    #[test]
     fn shutdown_replies_then_exits() {
-        let (reply, exit) = handle(&json!({ "id": 2, "method": "plugin/shutdown" }));
+        let (reply, exit) = handle(&json!({ "id": 2, "method": "plugin/shutdown" }), &mut |_p: &Value| None);
         assert!(reply.is_some() && exit);
     }
 }
