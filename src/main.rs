@@ -145,7 +145,7 @@ fn valid_col(col: &str) -> bool {
 fn truncate(s: &str, width: usize) -> String {
     let mut out: String = s.chars().take(width).collect();
     if s.chars().count() > width {
-        out.truncate(width.saturating_sub(1));
+        out = s.chars().take(width.saturating_sub(1)).collect();
         out.push('…');
     }
     out
