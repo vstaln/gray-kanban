@@ -68,6 +68,7 @@ fn manifest() -> Value {
             }
         }],
         "commands": ["/kanban"],
+        "command_descriptions": {"/kanban": "show and move cards on the kanban board"},
         "capabilities": ["host.ask"],
     })
 }
