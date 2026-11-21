@@ -219,10 +219,10 @@ fn act_boards(cwd: &str) -> Result<String, String> {
     let mut names: Vec<String> = Vec::new();
     if let Ok(rd) = std::fs::read_dir(&dir) {
         for e in rd.flatten() {
-            if let Some(name) = e.file_name().to_str() {
-                if let Some(stem) = name.strip_suffix(".json") {
-                    names.push(stem.to_string());
-                }
+            if let Some(name) = e.file_name().to_str()
+                && let Some(stem) = name.strip_suffix(".json")
+            {
+                names.push(stem.to_string());
             }
         }
     }
