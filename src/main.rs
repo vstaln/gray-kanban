@@ -219,10 +219,10 @@ fn act_boards(cwd: &str) -> Result<String, String> {
     let mut names: Vec<String> = Vec::new();
     if let Ok(rd) = std::fs::read_dir(&dir) {
         for e in rd.flatten() {
-            if let Some(name) = e.file_name().to_str() {
-                if let Some(stem) = name.strip_suffix(".json") {
-                    names.push(stem.to_string());
-                }
+            if let Some(name) = e.file_name().to_str()
+                && let Some(stem) = name.strip_suffix(".json")
+            {
+                names.push(stem.to_string());
             }
         }
     }
@@ -279,10 +279,10 @@ fn act_add(cwd: &str, board: &str, args: &Value) -> Result<String, String> {
 
 fn locate_card(b: &Value, id: &str) -> Result<(&'static str, usize), String> {
     for c in COLS {
-        if let Some(cards) = b["cols"][c].as_array() {
-            if let Some(pos) = cards.iter().position(|k| k["id"].as_str() == Some(id)) {
-                return Ok((c, pos));
-            }
+        if let Some(cards) = b["cols"][c].as_array()
+            && let Some(pos) = cards.iter().position(|k| k["id"].as_str() == Some(id))
+        {
+            return Ok((c, pos));
         }
     }
     Err(format!("no card '{id}' on this board"))
